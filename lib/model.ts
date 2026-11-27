@@ -1,8 +1,8 @@
-// Empirical Token Launch Valuation & Farm-Plan Engine (Node 22, stdlib only).
-// Derives implied FDV strictly from snapshot.json figures:
+// Empirical Token Launch Valuation & Farm-Plan Engine v2 (Node 22, stdlib only).
+// Derives implied FDV + Bear/Base/Bull range strictly from snapshot.json figures:
 //   implied_value_usd = tvl_usd * peer_multiple * momentum_mult * maturity_mult * chain_mult
-// where peer_multiple is the empirical median mcap/TVL of live-token protocols in the same category
-// (shrunk toward the global live-token median when peer sample size is small).
+// Peer multiples (P25 / P50 / P75) are computed empirically from live-token protocols in the same category,
+// with Bayesian shrinkage toward global live-token percentiles when peer sample size is small.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -29,15 +29,18 @@ export interface FarmStepDetail {
   step: string;
   cost: string;
   horizon: string;
+  priority: 'Core' | 'Multiplier' | 'Guardrail';
 }
 
 export interface PeerComp {
   slug: string;
   name: string;
   symbol: string;
+  category: string;
   tvl_usd: number;
   mcap_usd: number;
   multiple: number;
+  change_7d: number | null;
 }
 
 export interface RadarRow {
@@ -46,7 +49,9 @@ export interface RadarRow {
   rank: number;
   implied_value_usd: number;
   farm_steps: string[];
-  // Extended radar metadata for dashboard & judge transparency
+  // Extended model fields
+  bear_value_usd: number;
+  bull_value_usd: number;
   category: string;
   chains: string[];
   tvl_usd: number;
@@ -61,6 +66,7 @@ export interface RadarRow {
   chain_mult: number;
   effective_multiple: number;
   conviction: 'High' | 'Medium' | 'Speculative';
+  catalyst_signal: string;
   est_capital: string;
   est_horizon: string;
   farm_plan: FarmStepDetail[];
@@ -75,10 +81,14 @@ export interface RadarPayload {
   watchlist_count: number;
   pre_token_count: number;
   live_token_count: number;
+  global_p25: number;
   global_median_multiple: number;
+  global_p75: number;
   categories: string[];
+  top_categories: { category: string; count: number; tvl_usd: number }[];
   chains: string[];
   rows: RadarRow[];
+  live_peers: PeerComp[];
   live_peers_summary: { category: string; count: number; median_multiple: number }[];
 }
 
@@ -103,11 +113,15 @@ export function parseSnapshot(raw: string): Snapshot {
   return data;
 }
 
-function median(values: number[]): number {
+function quantile(values: number[], q: number): number {
   if (values.length === 0) return 0.25;
   const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1]! + sorted[mid]!) / 2 : sorted[mid]!;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const lo = sorted[base]!;
+  const hi = sorted[Math.min(sorted.length - 1, base + 1)]!;
+  return lo + rest * (hi - lo);
 }
 
 function clamp(n: number, lo: number, hi: number): number {
@@ -144,6 +158,16 @@ function primaryChainCost(chains: string[]): { chain: string; gas: string } {
   return { chain: c, gas: '$0.25-$3.00 gas' };
 }
 
+function deriveCatalyst(p: SnapshotProtocol, ageDays: number, tier: 'watchlist' | 'early_radar'): string {
+  const chg = p.change_7d ?? 0;
+  if (tier === 'watchlist' && chg >= 5) return 'Watchlist TVL Surge';
+  if (tier === 'watchlist' && ageDays >= 365) return 'Mature Tokenless Leader';
+  if (chg >= 15) return 'Rapid 7d Inflow';
+  if (p.chains.length >= 5) return 'Multi-Chain Expansion';
+  if (ageDays >= 365) return 'Long Tokenless Runway';
+  return 'Early TVL Accumulation';
+}
+
 function buildFarmPlan(p: SnapshotProtocol, ageDays: number, tier: 'watchlist' | 'early_radar'): {
   steps: FarmStepDetail[];
   estCapital: string;
@@ -153,57 +177,73 @@ function buildFarmPlan(p: SnapshotProtocol, ageDays: number, tier: 'watchlist' |
   const { chain, gas } = primaryChainCost(p.chains);
   const capital = tier === 'watchlist' ? '$500-$2,500' : '$250-$1,000';
   const horizon = ageDays >= 365 ? '30-60 days' : '60-120 days';
+  const chg = p.change_7d;
+  const flowAdvice =
+    chg !== null && chg >= 10
+      ? `7d TVL jumped +${chg.toFixed(1)}% — enter early before points dilution accelerates.`
+      : chg !== null && chg <= -10
+        ? `7d TVL dipped ${chg.toFixed(1)}% — scale in over 2 tranches and cap exposure until TVL stabilizes.`
+        : `7d TVL is steady (${chg === null ? 'n/a' : `${chg >= 0 ? '+' : ''}${chg.toFixed(1)}%`}) — ideal for steady epoch-weighted farming.`;
+
   const multiChainNote =
     p.chains.length >= 3
-      ? `Split activity across ${p.chains.slice(0, 3).join(', ')} (${p.chains.length} chains live) to qualify for multi-chain multipliers.`
-      : `Concentrate activity on ${chain} where ${p.name} holds its primary TVL.`;
+      ? `Split activity across ${p.chains.slice(0, 3).join(', ')} (${p.chains.length} chains live) to capture cross-chain multipliers.`
+      : `Concentrate activity on ${chain} where ${p.name} holds its core TVL.`;
 
   let coreAction: FarmStepDetail;
   let secondaryAction: FarmStepDetail;
 
   if (cat === 'Dexs' || cat === 'Derivatives' || cat === 'Perpetuals') {
     coreAction = {
-      step: `Execute 4-6 organic swaps or perp trades on ${p.name} (${chain}) totaling $2,000+ cumulative volume.`,
+      step: `Execute 4-6 organic swaps or perp trades on ${p.name} (${chain}) totaling $2,000+ cumulative volume across separate days.`,
       cost: `${capital} + ${gas}`,
       horizon: '14-30 days',
+      priority: 'Core',
     };
     secondaryAction = {
-      step: `Provide narrow-range or blue-chip LP on ${p.name} and hold through at least two weekly epoch snapshots.`,
+      step: `Provide blue-chip LP on ${p.name} and hold through at least two weekly epoch snapshots without withdrawing.`,
       cost: `${capital} LP`,
       horizon: '30-60 days',
+      priority: 'Multiplier',
     };
   } else if (cat === 'Lending' || cat === 'CDP' || cat === 'RWA') {
     coreAction = {
-      step: `Supply stablecoin or blue-chip collateral on ${p.name} (${chain}) and maintain an active position above dust thresholds.`,
+      step: `Supply stablecoin or blue-chip collateral on ${p.name} (${chain}) above dust thresholds ($250+) to start accruing epoch weight.`,
       cost: `${capital} + ${gas}`,
       horizon: '30-90 days',
+      priority: 'Core',
     };
     secondaryAction = {
       step: `Borrow 20-35% LTV against supplied collateral (keeping health factor > 2.0) to capture borrower-weighted points.`,
       cost: '1-4% net borrow APR',
       horizon: '30-60 days',
+      priority: 'Multiplier',
     };
   } else if (cat === 'Risk Curators' || cat === 'Onchain Capital Allocator' || cat === 'Yield' || cat === 'Yield Aggregator') {
     coreAction = {
-      step: `Deposit into ${p.name}'s flagship curated vault on ${chain} and retain receipt tokens in your wallet (do not transfer out).`,
+      step: `Deposit into ${p.name}'s flagship curated vault on ${chain} and keep receipt tokens in your wallet (avoid secondary transfers).`,
       cost: `${capital} + ${gas}`,
       horizon: '30-90 days',
+      priority: 'Core',
     };
     secondaryAction = {
       step: `Compound or rebalance once per epoch to register recurring on-chain interaction across consecutive weeks.`,
       cost: gas,
       horizon: 'Bi-weekly',
+      priority: 'Multiplier',
     };
   } else {
     coreAction = {
-      step: `Deploy ${capital} into ${p.name}'s core ${cat} contract on ${chain} using a single funded wallet with prior history.`,
+      step: `Deploy ${capital} into ${p.name}'s primary ${cat} contract on ${chain} from an established wallet with prior on-chain history.`,
       cost: `${capital} + ${gas}`,
       horizon: '30-60 days',
+      priority: 'Core',
     };
     secondaryAction = {
-      step: `Maintain at least 4 distinct weekly transactions on ${p.name} to avoid one-shot Sybil filters.`,
+      step: `Log at least 4 distinct weekly transactions on ${p.name} to clear standard Sybil and one-shot filters.`,
       cost: gas,
       horizon: '4+ weeks',
+      priority: 'Multiplier',
     };
   }
 
@@ -212,13 +252,15 @@ function buildFarmPlan(p: SnapshotProtocol, ageDays: number, tier: 'watchlist' |
       step: `Verify ${p.name}'s official ${chain} contracts and fund a dedicated farming wallet with ${capital} plus ${gas}.`,
       cost: `${capital} + ${gas}`,
       horizon: 'Day 1 (15 min)',
+      priority: 'Core',
     },
     coreAction,
     secondaryAction,
     {
-      step: `${multiChainNote} Track 7d TVL momentum (${p.change_7d === null ? 'n/a' : `${p.change_7d >= 0 ? '+' : ''}${p.change_7d.toFixed(1)}%`}) weekly and exit if TVL drops >35%.`,
+      step: `${multiChainNote} ${flowAdvice} Exit if protocol TVL drops >35%.`,
       cost: '$0 monitoring',
       horizon: horizon,
+      priority: 'Guardrail',
     },
   ];
 
@@ -234,31 +276,44 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
   );
 
   const allMultiples = liveProtocols.map((p) => clamp(p.mcap_usd! / p.tvl_usd, 0.03, 3.0));
-  const globalMedian = round4(median(allMultiples));
+  const globalP25 = round4(quantile(allMultiples, 0.25));
+  const globalMedian = round4(quantile(allMultiples, 0.5));
+  const globalP75 = round4(quantile(allMultiples, 0.75));
 
+  const livePeersAll: PeerComp[] = [];
   const catPeers = new Map<string, PeerComp[]>();
   for (const p of liveProtocols) {
     const cat = p.category ?? 'Other';
     const mult = clamp(p.mcap_usd! / p.tvl_usd, 0.03, 3.0);
-    const list = catPeers.get(cat) ?? [];
-    list.push({
+    const comp: PeerComp = {
       slug: p.slug,
       name: p.name,
       symbol: p.symbol ?? p.gecko_id ?? 'TOKEN',
+      category: cat,
       tvl_usd: p.tvl_usd,
       mcap_usd: p.mcap_usd!,
       multiple: round4(mult),
-    });
+      change_7d: p.change_7d,
+    };
+    livePeersAll.push(comp);
+    const list = catPeers.get(cat) ?? [];
+    list.push(comp);
     catPeers.set(cat, list);
   }
+  livePeersAll.sort((a, b) => b.mcap_usd - a.mcap_usd || a.slug.localeCompare(b.slug));
 
-  const catMedianMap = new Map<string, { median: number; count: number }>();
+  const catStatsMap = new Map<string, { p25: number; p50: number; p75: number; count: number }>();
   for (const [cat, peers] of catPeers.entries()) {
     peers.sort((a, b) => b.tvl_usd - a.tvl_usd);
-    const rawMed = median(peers.map((x) => x.multiple));
-    // Bayesian shrinkage toward global median for small categories (prior weight = 3)
-    const shrunk = (peers.length * rawMed + 3 * globalMedian) / (peers.length + 3);
-    catMedianMap.set(cat, { median: round4(shrunk), count: peers.length });
+    const vals = peers.map((x) => x.multiple);
+    const n = peers.length;
+    const shrink = (raw: number, prior: number) => round4((n * raw + 3 * prior) / (n + 3));
+    catStatsMap.set(cat, {
+      p25: shrink(quantile(vals, 0.25), globalP25),
+      p50: shrink(quantile(vals, 0.5), globalMedian),
+      p75: shrink(quantile(vals, 0.75), globalP75),
+      count: n,
+    });
   }
 
   // 2. Select all 40 watchlist protocols + top 180 clean pre-token early protocols by TVL
@@ -277,23 +332,22 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
     const tier: 'watchlist' | 'early_radar' = watchlistSet.has(p.slug) ? 'watchlist' : 'early_radar';
     const ageDays = daysBetween(snapshot.as_of, p.listed_at);
 
-    const catInfo = catMedianMap.get(cat);
-    const peerMultiple = catInfo ? catInfo.median : globalMedian;
+    const catInfo = catStatsMap.get(cat);
+    const peerP25 = catInfo ? catInfo.p25 : globalP25;
+    const peerMultiple = catInfo ? catInfo.p50 : globalMedian;
+    const peerP75 = catInfo ? catInfo.p75 : globalP75;
     const peerCount = catInfo ? catInfo.count : 0;
 
-    // 7d TVL momentum multiplier: bounded [0.80, 1.35]
     const chg = p.change_7d ?? 0;
     const momentumMult = round4(clamp(1 + chg / 100, 0.8, 1.35));
-
-    // Tokenless operating maturity: protocols running 6-24+ months with high TVL without a token
-    // carry higher launch-readiness multiple: bounded [0.88, 1.25]
     const maturityMult = round4(clamp(0.88 + 0.11 * Math.log10(Math.max(10, ageDays) / 10), 0.88, 1.25));
-
-    // Multi-chain footprint multiplier: bounded [1.00, 1.18]
     const chainMult = round4(clamp(1 + 0.04 * Math.log2(Math.max(1, p.chains.length)), 1.0, 1.18));
 
-    const effectiveMultiple = round4(peerMultiple * momentumMult * maturityMult * chainMult);
+    const factor = momentumMult * maturityMult * chainMult;
+    const effectiveMultiple = round4(peerMultiple * factor);
     const impliedValue = Math.max(100_000, Math.round(p.tvl_usd * effectiveMultiple));
+    const bearValue = Math.max(50_000, Math.round(p.tvl_usd * peerP25 * factor));
+    const bullValue = Math.max(impliedValue, Math.round(p.tvl_usd * peerP75 * factor));
 
     const conviction: 'High' | 'Medium' | 'Speculative' =
       tier === 'watchlist' && ageDays >= 180
@@ -312,6 +366,8 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
       rank: 0,
       implied_value_usd: impliedValue,
       farm_steps: farmSteps,
+      bear_value_usd: bearValue,
+      bull_value_usd: bullValue,
       category: cat,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
@@ -326,6 +382,7 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
       chain_mult: chainMult,
       effective_multiple: effectiveMultiple,
       conviction,
+      catalyst_signal: deriveCatalyst(p, ageDays, tier),
       est_capital: estCapital,
       est_horizon: estHorizon,
       farm_plan: steps,
@@ -333,24 +390,34 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
     };
   });
 
-  // 4. Deterministic sort by implied_value_usd descending, tie-break by tvl_usd desc then slug asc
   scored.sort((a, b) => b.implied_value_usd - a.implied_value_usd || b.tvl_usd - a.tvl_usd || a.slug.localeCompare(b.slug));
   scored.forEach((row, idx) => {
     row.rank = idx + 1;
   });
 
-  const categories = [...new Set(scored.map((r) => r.category))].sort();
+  const catAgg = new Map<string, { count: number; tvl_usd: number }>();
   const chainCounts = new Map<string, number>();
   for (const r of scored) {
+    const cur = catAgg.get(r.category) ?? { count: 0, tvl_usd: 0 };
+    cur.count += 1;
+    cur.tvl_usd += r.tvl_usd;
+    catAgg.set(r.category, cur);
     for (const c of r.chains) chainCounts.set(c, (chainCounts.get(c) ?? 0) + 1);
   }
+
+  const categories = [...catAgg.keys()].sort();
+  const topCategories = [...catAgg.entries()]
+    .map(([category, v]) => ({ category, count: v.count, tvl_usd: v.tvl_usd }))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || a.category.localeCompare(b.category))
+    .slice(0, 8);
+
   const chains = [...chainCounts.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, 20)
     .map(([c]) => c);
 
-  const livePeersSummary = [...catMedianMap.entries()]
-    .map(([category, info]) => ({ category, count: info.count, median_multiple: info.median }))
+  const livePeersSummary = [...catStatsMap.entries()]
+    .map(([category, info]) => ({ category, count: info.count, median_multiple: info.p50 }))
     .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
 
   const radar: RadarPayload = {
@@ -361,10 +428,14 @@ export function buildRadar(snapshot: Snapshot): { board: RadarRow[]; radar: Rada
     watchlist_count: snapshot.watchlist.length,
     pre_token_count: candidates.length,
     live_token_count: liveProtocols.length,
+    global_p25: globalP25,
     global_median_multiple: globalMedian,
+    global_p75: globalP75,
     categories,
+    top_categories: topCategories,
     chains,
     rows: scored,
+    live_peers: livePeersAll,
     live_peers_summary: livePeersSummary,
   };
 
